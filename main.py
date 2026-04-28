@@ -13,7 +13,6 @@ import resource
 import signal
 import json
 import asyncio
-import pickle
 import subprocess
 import math
 import calendar
@@ -47,7 +46,6 @@ LOG_FILE = os.path.join(BASE_DIR, 'dashboard.log')
 # ######################
 ENABLE_STRAVA = False
 ENABLE_BAMBU = False
-ENABLE_ROBOROCK = False
 ENABLE_ANTIGRAVITY = False
 ENABLE_CLAUDE = False
 ENABLE_SPOTIFY = False
@@ -75,10 +73,6 @@ PRINTER_CONF = {
     'ACCESS_CODE': ''
 }
 
-ROBOROCK_CONF = {
-    'EMAIL': 'email...'
-}
-
 LASTFM_CONF = {
     'API_KEY': '',
     'USERNAME': ''
@@ -90,8 +84,6 @@ STRAVA_CONF = {
 
 # --- FILES & SCOPES ---
 GMAIL_TOKEN_PATH = os.path.join(BASE_DIR, 'token.json')
-ROBOROCK_TOKEN_FILE = os.path.join(BASE_DIR, 'roborock_session.pkl')
-ROBOROCK_STATS_FILE = os.path.join(BASE_DIR, 'roborock_stats.json')
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
 if os.path.exists(LIB_DIR):
@@ -99,16 +91,17 @@ if os.path.exists(LIB_DIR):
 
 try:
     from waveshare_epd import epd10in85
+except ImportError:
+    pass
+
+try:
     import bambulabs_api as bl
-    from roborock.web_api import RoborockApiClient
-    from roborock.devices.device_manager import create_device_manager, UserParams
 except ImportError:
     pass
 
 # --- LOGGING ---
 logging.getLogger("bambulabs_api").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-logging.getLogger("roborock").setLevel(logging.CRITICAL)
 logging.getLogger("aiomqtt").setLevel(logging.CRITICAL)
 
 logger = logging.getLogger()
@@ -201,10 +194,6 @@ class DataStore:
         self.spotify = {'status': 'PAUSED', 'text': '', 'cover': None}
         self.claude = {'error': False, 'five_hour': {}, 'seven_day': {}}
         self.antigravity = {'error': False, 'models': []}
-        self.roborock = {
-            'status': 'OFFLINE', 'battery': 0, 'is_cleaning': False,
-            'current_area': 0.0, 'ref_area': 0.0, 'pct': 0.0, 'last_date': '-'
-        }
         self.sysload = {'cpu': 0, 'ram_free': 0, 'history': deque(maxlen=30)}
         self.crypto = {'btc': 0, 'eth': 0, 'btc_hist': [], 'eth_hist': []}
         self.ping = {'current': 0, 'history': deque(maxlen=50)}
@@ -437,100 +426,6 @@ def fetch_strava_data():
     }
 
 
-def auth_roborock(email):
-    global ENABLE_ROBOROCK
-    if not ENABLE_ROBOROCK: return None
-
-    if os.path.exists(ROBOROCK_TOKEN_FILE):
-        try:
-            with open(ROBOROCK_TOKEN_FILE, "rb") as f:
-                return pickle.load(f)
-        except:
-            pass
-
-    print("\n--- ROBOROCK AUTHORIZATION REQUIRED ---")
-
-    async def _do_auth():
-        web_api = RoborockApiClient(username=email)
-        await web_api.request_code()
-        code = input(f"Enter 6-digit Roborock auth code sent to {email} (or press Enter to disable): ").strip()
-        if not code: return None
-        user_data = await web_api.code_login(code)
-        with open(ROBOROCK_TOKEN_FILE, "wb") as f: pickle.dump(user_data, f)
-        print("Roborock Authorization Successful!\n")
-        return user_data
-
-    if sys.platform == "win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    try:
-        user_data = asyncio.run(_do_auth())
-        if not user_data:
-            print("Roborock is disabled. Fallback widget (Ping) will be used.\n")
-            ENABLE_ROBOROCK = False
-        return user_data
-    except Exception as e:
-        print(f"Failed to auth Roborock: {e}")
-        ENABLE_ROBOROCK = False
-        return None
-
-
-def roborock_update_thread(user_data, email):
-    if not ENABLE_ROBOROCK or not user_data: return
-
-    async def _loop():
-        ref_area, last_date = 0.0, "-"
-        if os.path.exists(ROBOROCK_STATS_FILE):
-            try:
-                with open(ROBOROCK_STATS_FILE, "r") as f:
-                    stats = json.load(f)
-                    ref_area, last_date = stats.get("ref_area", 0.0), stats.get("last_date", "-")
-            except:
-                pass
-
-        user_params = UserParams(username=email, user_data=user_data)
-        device_manager = await create_device_manager(user_params)
-
-        short_states = {
-            5: "Clean", 6: "Return", 8: "Charge", 10: "Pause",
-            17: "Spot", 18: "Room", 22: "Empty", 23: "Wash",
-            26: "ToWash", 29: "Map"
-        }
-
-        while True:
-            try:
-                devices = await device_manager.get_devices()
-                if devices and devices[0].v1_properties:
-                    device = devices[0]
-                    status_trait = device.v1_properties.status
-                    await status_trait.refresh()
-                    current_area = (status_trait.clean_area / 1000000) if status_trait.clean_area else 0
-
-                    is_cleaning = status_trait.state in [5, 6, 10, 17, 18, 22, 23, 26, 29]
-                    status_str = short_states.get(status_trait.state, f"S:{status_trait.state}")
-
-                    if not is_cleaning and current_area > 0 and current_area != ref_area:
-                        ref_area = current_area
-                        last_date = datetime.now().strftime("%d %b %H:%M")
-                        with open(ROBOROCK_STATS_FILE, "w") as f: json.dump(
-                            {"ref_area": ref_area, "last_date": last_date}, f)
-
-                    pct = (current_area / ref_area) * 100 if is_cleaning and ref_area > 0 else 0.0
-
-                    with data_store.lock:
-                        data_store.roborock = {
-                            'status': status_str, 'battery': status_trait.battery,
-                            'is_cleaning': is_cleaning, 'current_area': current_area,
-                            'ref_area': ref_area, 'pct': pct, 'last_date': last_date
-                        }
-            except Exception as e:
-                logging.error(f"Roborock error: {e}")
-            await asyncio.sleep(60)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(_loop())
-
-
 def update_data_thread():
     global global_printer
 
@@ -635,7 +530,7 @@ def update_data_thread():
                             data_store.crypto['eth_hist'] = prices[::len(prices) // 50][:50]
                 data_store.last_update['crypto'] = now
 
-        if not ENABLE_ROBOROCK and not ENABLE_ANTIGRAVITY:
+        if not ENABLE_ANTIGRAVITY:
             if now - data_store.last_update['ping'] > 20:
                 try:
                     out = subprocess.check_output(['ping', '-c', '1', '-W', '1', '8.8.8.8']).decode('utf-8')
@@ -804,7 +699,6 @@ def render_screen(epd, fonts):
         aqi = data_store.aqi
         strava = data_store.strava.copy()
         printer = data_store.printer.copy()
-        rob = data_store.roborock.copy()
         gmail_unread = data_store.gmail_unread
         spotify = data_store.spotify.copy()
         claude = data_store.claude.copy()
@@ -873,21 +767,9 @@ def render_screen(epd, fonts):
 
     draw.line((col1_x, 320, col_w - 20, 320), fill=0, width=2)
 
-    # Widget 3: Roborock or Ping
+    # Widget 3: Antigravity or Ping
     y3 = 340
-    if ENABLE_ROBOROCK:
-        draw_icon(draw, col1_x, y3, "icon_roborock", (50, 50))
-        draw.text((col1_x + 60, y3), f"Bat: {rob['battery']}% | {rob['status']}", font=fonts['28'], fill=0)
-        if rob['is_cleaning']:
-            draw.text((col1_x + 60, y3 + 35), f"Clean: {rob['current_area']:.1f} m2 ({rob['pct']:.0f}%)",
-                      font=fonts['24'], fill=0)
-            clamped_pct = min(rob['pct'], 100)
-            draw.rectangle((col1_x + 60, y3 + 70, col1_x + 390, y3 + 90), outline=0)
-            draw.rectangle((col1_x + 60, y3 + 70, col1_x + 60 + int(330 * (clamped_pct / 100)), y3 + 90), fill=0)
-        else:
-            draw.text((col1_x + 60, y3 + 35), f"Last: {rob['last_date']} | {rob['ref_area']:.1f} m2", font=fonts['24'],
-                      fill=0)
-    elif ENABLE_ANTIGRAVITY:
+    if ENABLE_ANTIGRAVITY:
         draw_icon(draw, col1_x, y3, "icon_cpu", (50, 50))
         draw.text((col1_x + 60, y3), "ANTIGRAVITY USAGE", font=fonts['28'], fill=0)
         
@@ -1149,7 +1031,6 @@ def main():
     auth_strava()
     auth_claude()
     auth_antigravity()
-    roborock_user_data = auth_roborock(ROBOROCK_CONF['EMAIL'])
 
     signal.signal(signal.SIGALRM, timeout_handler)
     epd = None
@@ -1179,11 +1060,6 @@ def main():
         t_data = threading.Thread(target=update_data_thread)
         t_data.daemon = True
         t_data.start()
-
-        if ENABLE_ROBOROCK:
-            t_robo = threading.Thread(target=roborock_update_thread, args=(roborock_user_data, ROBOROCK_CONF['EMAIL']))
-            t_robo.daemon = True
-            t_robo.start()
 
         refresh_counter = 0
 
